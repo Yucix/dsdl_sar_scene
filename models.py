@@ -38,7 +38,7 @@ def modify_resnet_conv1(model: nn.Module, in_channels: int) -> nn.Module:
 
     
 class SARViGBackbone(nn.Module):
-    def __init__(self, in_channels=1, patch_size=16, embed_dim=320, num_blocks=6, num_patches=256, out_dim=2048):
+    def __init__(self, in_channels=1, patch_size=16, embed_dim=320, num_blocks=8, num_patches=256, out_dim=2048,drop_path=0.1):
         super().__init__()
         
         # 1. 选点与切片 (Patchifier)
@@ -54,7 +54,7 @@ class SARViGBackbone(nn.Module):
         # 堆叠多个 ViG Block 来替代 ResNet 的层
         # num_blocks 可以设为 6, 8, 12 等，层数越深特征越强
         self.blocks = nn.Sequential(*[
-            ViGBlock(in_features=embed_dim, num_edges=9, head_num=4) 
+            ViGBlock(in_features=embed_dim, num_edges=9, head_num=4, drop_path=drop_path) 
             for _ in range(num_blocks)
         ])
         
@@ -131,7 +131,8 @@ class DSDL(nn.Module):
             embed_dim=320,  # 内部特征维度，可以调大如 512
             num_blocks=8,   # 堆叠层数，建议 6-12 层
             num_patches=256,# 对应 256x256 输入
-            out_dim=2048    # 必须是 2048，以便与 ResNet 光学分支对齐
+            out_dim=2048,    # 必须是 2048，以便与 ResNet 光学分支对齐
+            drop_path=0.1
         )
 
         self.pooling = nn.AdaptiveMaxPool2d((1, 1))

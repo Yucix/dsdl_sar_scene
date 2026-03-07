@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from timm.models.layers import DropPath
 
 class ResBlock(nn.Module):
     def __init__(self, in_channels, out_channels, mid_channels=None, bn=False):
@@ -42,15 +42,15 @@ class TwoLayerNN(nn.Module):
 
 
 class ViGBlock(nn.Module):
-    def __init__(self, in_features, num_edges=9, head_num=1):
+    def __init__(self, in_features, num_edges=9, head_num=1, drop_path=0.1):
         super().__init__()
         self.k = num_edges
         self.in_layer1 = TwoLayerNN(in_features)
         self.out_layer1 = TwoLayerNN(in_features)
-        self.droppath1 = nn.Identity()  # DropPath(0)
+        self.droppath1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.in_layer2 = TwoLayerNN(in_features, in_features * 4)
         self.out_layer2 = TwoLayerNN(in_features, in_features * 4)
-        self.droppath2 = nn.Identity()  # DropPath(0)
+        self.droppath2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.multi_head_fc = nn.Conv1d(
             in_features * 2, in_features, 1, 1, groups=head_num
         )
