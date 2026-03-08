@@ -67,7 +67,7 @@ class SARViGBackbone(nn.Module):
         nn.init.normal_(self.pose_embedding, std=0.02)
 
     def forward(self, x):
-        # x: [B, 1, 224, 224]
+        # x: [B, 1, 256, 256]
         
         # 1. Patchify
         # [B, 256, 16*16]
@@ -185,7 +185,7 @@ class DSDL(nn.Module):
         # ===== 光学分支 =====
         f_opt = self.features_opt(optical)  # [B, 2048, H, W]
         # 使用 GMP 并展平空间维度
-        f_opt = self.pooling_opt(f_opt).squeeze(-1).squeeze(-1) # [B, 2048]
+        f_opt = self.pooling(f_opt).squeeze(-1).squeeze(-1) # [B, 2048]
 
         # ===== SAR分支 =====
         # 直接通过 ViG Backbone 得到 2048 维特征
