@@ -130,7 +130,7 @@ class DSDL(nn.Module):
             patch_size=16, 
             embed_dim=320,  # 内部特征维度，可以调大如 512
             num_blocks=8,   # 堆叠层数，建议 6-12 层
-            num_patches=256,# 对应 256x256 输入
+            num_patches=256,
             out_dim=2048,    # 必须是 2048，以便与 ResNet 光学分支对齐
             drop_path=0.1
         )

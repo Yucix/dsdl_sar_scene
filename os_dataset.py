@@ -99,15 +99,15 @@ class OSDataset(data.Dataset):
         # ==========================================
         fusion = np.concatenate([opt, sar], axis=2)
 
-        # ==========================================
-        # 4. 标准化 (标准化参数调整)
+        # # ==========================================
+        # # 4. 标准化 (标准化参数调整)
                 
-        # 对标dsdl代码中engine的normalize部分
-        mean = [0.485, 0.456, 0.406, 0.5, 0.5] 
-        std  = [0.229, 0.224, 0.225, 0.5, 0.5]
+        # # 对标dsdl代码中engine的normalize部分
+        # mean = [0.485, 0.456, 0.406, 0.5, 0.5] 
+        # std  = [0.229, 0.224, 0.225, 0.5, 0.5]
         
-        for c in range(5):
-            fusion[:, :, c] = (fusion[:, :, c] - mean[c]) / std[c]
+        # for c in range(5):
+        #     fusion[:, :, c] = (fusion[:, :, c] - mean[c]) / std[c]
 
         # 转 tensor: (5, H, W)
         fusion = torch.from_numpy(fusion).permute(2, 0, 1)
