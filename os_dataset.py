@@ -4,44 +4,32 @@ import torch
 import torch.utils.data as data
 import numpy as np
 import rasterio
+import random
+import torchvision.transforms.functional as TF
 
-# 类别
 s2_categories = ['water', 'road', 'building',
                  'barren', 'vegetation', 'farmland']
 
-
 class OSDataset(data.Dataset):
-    """
-    Optical(S2) + SAR(S1) 融合数据集：
-    - optical: root/set/optical/*.tif
-    - sar:     root/set/sar/*.tif
-    - labels:  root/set/labels.json, key = optical 文件名，value = 标签列表
-    输出:
-    - fusion: Tensor [5, H, W]  (4 optical + 1 SAR)
-    - name:   光学图像文件名
-    - [inp]:  类别词向量 [num_classes, 300]
-    - target: 多标签 one-hot [num_classes]
-    """
-
-    def __init__(self, root, set='train', transform=None, target_transform=None, inp_name=None):
+    def __init__(self, root, set='train', transform=None, target_transform=None, inp_name=None, num_segments=64, patch_size=8):
         self.root = root
         self.set = set
-
-        self.optical_dir = os.path.join(root, set, "optical")
-        self.sar_dir = os.path.join(root, set, "sar")
-        self.label_path = os.path.join(root, set, "labels.json")
-
+        self.num_segments = num_segments
+        self.patch_size = patch_size
         self.transform = transform
         self.target_transform = target_transform
 
-        # 加载标签
+        self.optical_dir = os.path.join(root, set, "optical")
+        self.sar_dir = os.path.join(root, set, "sar")
+        self.nodes_dir = os.path.join(root, set, f"aug_nodes_slico_seg{num_segments}_patch{patch_size}")
+        self.label_path = os.path.join(root, set, "labels.json")
+
         with open(self.label_path, "r") as f:
             self.labels = json.load(f)
 
         self.files = list(self.labels.keys())
         self.num_classes = len(s2_categories)
 
-        # 加载词向量（类别语义向量）
         if inp_name and os.path.exists(inp_name):
             import pickle
             with open(inp_name, 'rb') as f:
@@ -51,14 +39,12 @@ class OSDataset(data.Dataset):
 
         print(f"[OSDataset] {set}: {len(self.files)} samples loaded.")
 
-    # 读取 tiff 文件 → numpy (H, W, C)
     def load_tiff(self, path):
         with rasterio.open(path) as src:
-            img = src.read()  # (C, H, W)
-            img = np.transpose(img, (1, 2, 0))  # → (H, W, C)
+            img = src.read()
+            img = np.transpose(img, (1, 2, 0))
         return img
 
-    # 固定 Optical 为 4 通道（不足补零，超过截取前4）
     def normalize_optical(self, opt):
         h, w, c = opt.shape
         if c >= 4:
@@ -66,57 +52,54 @@ class OSDataset(data.Dataset):
         else:
             pad = np.zeros((h, w, 4 - c), dtype=opt.dtype)
             opt = np.concatenate([opt, pad], axis=2)
-        return opt  # (H, W, 4)
+        return opt
 
-    # 统一 SAR 为 1 通道（取第一个通道）
     def normalize_sar(self, sar):
         if sar.ndim == 2:
             sar = sar[:, :, None]
-        return sar[:, :, 0:1]  # (H, W, 1)
+        return sar[:, :, 0:1]
 
     def __getitem__(self, index):
         fname_opt = self.files[index]
-
-        # 路径
         opt_path = os.path.join(self.optical_dir, fname_opt)
         sar_name = fname_opt.replace("S2", "S1")
         sar_path = os.path.join(self.sar_dir, sar_name)
 
-        # ==========================================
-        # 1. 光学数据 
-        # ==========================================
         opt = self.load_tiff(opt_path)
         opt = self.normalize_optical(opt)
-
-        # ==========================================
-        # 2. 雷达数据 
-        # ==========================================
         sar = self.load_tiff(sar_path)
         sar = self.normalize_sar(sar)
 
-        # ==========================================
-        # 3. 拼接 (不变)
-        # ==========================================
         fusion = np.concatenate([opt, sar], axis=2)
+        fusion = torch.from_numpy(fusion).permute(2, 0, 1).float()  # [5,H,W]
 
-        # # ==========================================
-        # # 4. 标准化 (标准化参数调整)
-                
-        # # 对标dsdl代码中engine的normalize部分
-        # mean = [0.485, 0.456, 0.406, 0.5, 0.5] 
-        # std  = [0.229, 0.224, 0.225, 0.5, 0.5]
+        fusion = TF.resize(fusion, [256, 256], antialias=True)
+
+        # 核心：离散增强同步逻辑
+        aug_type = "orig" # 默认或测试集使用原图
         
-        # for c in range(5):
-        #     fusion[:, :, c] = (fusion[:, :, c] - mean[c]) / std[c]
+        if self.set == "train":
+            aug_type = random.choice(["orig", "hflip", "vflip", "rot180"])
+            
+            # 对图像 Tensor 进行绝对同步的空间变换
+            if aug_type == "hflip":
+                fusion = TF.hflip(fusion)
+            elif aug_type == "vflip":
+                fusion = TF.vflip(fusion)
+            elif aug_type == "rot180":
+                fusion = torch.rot90(fusion, k=2, dims=[1, 2])
 
-        # 转 tensor: (5, H, W)
-        fusion = torch.from_numpy(fusion).permute(2, 0, 1)
+        # 读取与其空间状态完全对应的预存 nodes
+        node_name = sar_name.replace(".tif", f"_{aug_type}.npy")
+        node_path = os.path.join(self.nodes_dir, node_name)
+        
+        if not os.path.exists(node_path):
+            raise FileNotFoundError(f"Missing precomputed node file: {node_path}")
+            
+        nodes = np.load(node_path)
+        nodes = torch.from_numpy(nodes).float()
 
-        # Tensor 级 transform（由 engine 注入）
-        if self.transform:
-            fusion = self.transform(fusion)
-
-        # 标签 → one-hot
+        # 标签提取
         labels = self.labels[fname_opt]
         target = torch.zeros(self.num_classes)
         for lb in labels:
@@ -126,7 +109,7 @@ class OSDataset(data.Dataset):
         if self.target_transform:
             target = self.target_transform(target)
 
-        return (fusion, fname_opt, [self.inp]), target
+        return (fusion, fname_opt, [self.inp], nodes), target
 
     def __len__(self):
         return len(self.files)

@@ -6,7 +6,7 @@ import torch.optim
 import csv
 import datetime
 import numpy as np
-import random
+import random  
 
 # 保证 src 模块能被正确导入
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -21,11 +21,12 @@ from models import load_model
 # 默认路径
 # ===============================
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-DEFAULT_DATA_PATH = "/media/sata/xyx/dsdl_os"
+DEFAULT_DATA_PATH = "/media/sata/xyx/dsdl/dataset"
 DEFAULT_EMBEDDING_PATH = os.path.join(DEFAULT_DATA_PATH, "embeddings/s2_glove_word2vec.pkl")
-DEFAULT_CHECKPOINT_PATH = "/media/sata/xyx/checkpoints/dsdl_sar_scene/"
-DEFAULT_LOG_PATH = os.path.join(project_root, "/media/sata/xyx/logs/dsdl_sar_scene/")
+DEFAULT_CHECKPOINT_PATH = "/media/sata/xyx/dsdl/checkpoints/dsdl_sar/"
+DEFAULT_LOG_PATH = os.path.join(project_root, "/media/sata/xyx/dsdl/logs/dsdl_sar/")
 
+# 保证实验可复现的随机种子
 def seed_everything(seed=42):
     random.seed(seed)
     np.random.seed(seed)
@@ -35,7 +36,7 @@ def seed_everything(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-seed_everything(3407) 
+seed_everything(3407)
 
 # =================================
 # 日志记录类
@@ -130,9 +131,18 @@ parser.add_argument('--resume', default='', type=str, help='path to checkpoint t
 parser.add_argument('--evaluate', action='store_true')
 parser.add_argument('--lambd', default=0.001, type=float)
 parser.add_argument('--beta', default=0.005, type=float)
-parser.add_argument('--gamma', default=1.0, type=float)
 parser.add_argument('--log-dir', default=DEFAULT_LOG_PATH, type=str)
-
+parser.add_argument('--early-stop', action='store_true',
+                    help='enable early stopping based on validation Micro-F1')
+parser.add_argument('--patience', default=15, type=int,
+                    help='number of epochs with no improvement before stopping')
+parser.add_argument('--sar-patch-size', default=16, type=int)
+parser.add_argument('--sar-embed-dim', default=64, type=int)
+parser.add_argument('--sar-num-vig-blocks', default=2, type=int)
+parser.add_argument('--sar-num-segments', default=64, type=int)
+parser.add_argument('--sar-num-edges', default=9, type=int)
+parser.add_argument('--sar-head-num', default=1, type=int)
+parser.add_argument('--sar-drop-path', default=0.05, type=float)
 
 # ===============================
 # main function
@@ -152,16 +162,41 @@ def main_os():
         print(f"Resume from checkpoint: {args.resume}")
 
     # ============ Dataset ============
-    train_dataset = OSDataset(root=args.data, set="train", transform=None, inp_name=DEFAULT_EMBEDDING_PATH)
-    val_dataset = OSDataset(root=args.data, set="test", transform=None, inp_name=DEFAULT_EMBEDDING_PATH)
+    train_dataset = OSDataset(
+        root=args.data,
+        set="train",
+        transform=None,
+        inp_name=DEFAULT_EMBEDDING_PATH,
+        num_segments=args.sar_num_segments,
+        patch_size=args.sar_patch_size,
+    )
+    val_dataset = OSDataset(
+        root=args.data,
+        set="test",
+        transform=None,
+        inp_name=DEFAULT_EMBEDDING_PATH,
+        num_segments=args.sar_num_segments,
+        patch_size=args.sar_patch_size,
+    )
 
     # ============ Model ============
     num_classes = 6
-    model = load_model(num_classes=num_classes, alpha=args.lambd)
+
+    model = load_model(
+    num_classes=num_classes,
+    alpha=args.lambd,
+    sar_patch_size=args.sar_patch_size,
+    sar_embed_dim=args.sar_embed_dim,
+    sar_num_vig_blocks=args.sar_num_vig_blocks,
+    sar_num_segments=args.sar_num_segments,
+    sar_num_edges=args.sar_num_edges,
+    sar_head_num=args.sar_head_num,
+    sar_drop_path=args.sar_drop_path,
+)
 
     # ============ Loss & Optimizer ============
-    criterion = MyLoss(lambd=args.lambd, beta=args.beta, gamma=args.gamma)
-    # AdamW 优化器
+    criterion = MyLoss(args.lambd, args.beta)
+    #  AdamW 优化器
     optimizer = torch.optim.AdamW(
         model.get_config_optim(args.lr, args.lrp),
         lr=args.lr,
@@ -182,7 +217,9 @@ def main_os():
         'device_ids': args.device_ids,
         'dataset': 'os',
         'logger': logger,
-        'save_model_path': DEFAULT_CHECKPOINT_PATH
+        'save_model_path': DEFAULT_CHECKPOINT_PATH,
+        'early_stop': args.early_stop,
+        'patience': args.patience,
     }
 
     engine = DSDLMultiLabelMAPEngine(state)
@@ -199,6 +236,7 @@ def main_os():
     print(" Training Complete! ")
     print("############################################")
     print(f"Best Micro-F1 = {best_metrics.get('Micro_F1', best_score)}")
+    print(f"Best Epoch    = {engine.state.get('best_epoch', 'N/A')}")
     print(f"Macro-F1      = {best_metrics.get('Macro_F1', 'N/A')}")
     print(f"Macro-P       = {best_metrics.get('Macro_P', 'N/A')}")
     print(f"Macro-R       = {best_metrics.get('Macro_R', 'N/A')}")

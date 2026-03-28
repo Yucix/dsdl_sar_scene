@@ -13,6 +13,56 @@ import math
 from util import AveragePrecisionMeter
 
 
+
+def os_node_collate_fn(batch):
+    """
+    batch: list of [ ((fusion, fname, [inp], nodes), target), ... ]
+    返回：
+        (fusion_batch, fname_list, [inp], nodes_batch, node_mask), target_batch
+    """
+    inputs, targets = zip(*batch)
+
+    fusions = []
+    fnames = []
+    inps = []
+    nodes_list = []
+
+    for item in inputs:
+        fusion, fname, inp, nodes = item
+        fusions.append(fusion)
+        fnames.append(fname)
+        inps.append(inp[0])   # 原来 inp 是 [self.inp]
+        nodes_list.append(nodes)
+
+    fusion_batch = torch.stack(fusions, dim=0)
+    inp_batch = torch.stack(inps, dim=0)
+    target_batch = torch.stack(targets, dim=0)
+
+    max_nodes = max(n.shape[0] for n in nodes_list)
+    feat_dim = nodes_list[0].shape[1]
+
+    padded_nodes = []
+    node_masks = []
+
+    for nodes in nodes_list:
+        n = nodes.shape[0]
+        pad_n = max_nodes - n
+
+        if pad_n > 0:
+            padding = torch.zeros(pad_n, feat_dim, dtype=nodes.dtype)
+            nodes = torch.cat([nodes, padding], dim=0)
+
+        mask = torch.zeros(max_nodes, dtype=torch.bool)
+        mask[:n] = True
+
+        padded_nodes.append(nodes)
+        node_masks.append(mask)
+
+    nodes_batch = torch.stack(padded_nodes, dim=0)   # [B, Nmax, F]
+    node_mask = torch.stack(node_masks, dim=0)       # [B, Nmax]
+
+    return (fusion_batch, fnames, [inp_batch], nodes_batch, node_mask), target_batch
+
 class Engine(object):
     def __init__(self, state=None):
         if state is None:
@@ -31,6 +81,11 @@ class Engine(object):
         self.state.setdefault('epoch_step', [])
         self.state.setdefault('save_model_path', './checkpoints/')
         self.state.setdefault('best_score', 0)
+        self.state.setdefault('early_stop', False)
+        self.state.setdefault('patience', 15)
+        self.state.setdefault('best_epoch', -1)
+        self.state.setdefault('epochs_no_improve', 0)
+
 
         self.state['meter_loss'] = tnt.meter.AverageValueMeter()
         self.state['batch_time'] = tnt.meter.AverageValueMeter()
@@ -127,23 +182,15 @@ class Engine(object):
 
     # ===== 训练配置 =====
     def init_learning(self, model, criterion):
-        self.state['train_transform'] = transforms.Compose([
-            transforms.Resize((self.state['image_size'], self.state['image_size'])),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomVerticalFlip(),
-            transforms.RandomRotation(degrees=180),
-        ])
-
-        self.state['val_transform'] = transforms.Compose([
-            transforms.Resize((self.state['image_size'], self.state['image_size'])),
-        ])
-
+        self.state['train_transform'] = None
+        self.state['val_transform'] = None
+        
     def adjust_learning_rate(self, optimizer):
         epoch = self.state['epoch']
         max_epochs = self.state['max_epochs']
         warmup_epochs = 5  # 设置前 5 个 epoch 为 Warmup 阶段
         
-        # 第一次调用时，记录每个参数组的初始学习率 (保留光学和 SAR 分支的区别)
+        # 第一次调用时，记录每个参数组的初始学习率
         for param_group in optimizer.param_groups:
             if 'initial_lr' not in param_group:
                 param_group['initial_lr'] = param_group['lr']
@@ -158,7 +205,7 @@ class Engine(object):
             progress = (epoch - warmup_epochs) / (max_epochs - warmup_epochs)
             scale = 0.5 * (1.0 + math.cos(math.pi * progress))
             
-            # 设定一个最小学习率底线 (例如初始学习率的 1%)，防止后期学习率降为绝对的 0
+            # 设定一个最小学习率底线 (例如初始学习率的 1%)
             min_scale = 0.01 
             scale = min_scale + (1.0 - min_scale) * scale
 
@@ -187,15 +234,30 @@ class Engine(object):
         train_dataset.transform = self.state['train_transform']
         val_dataset.transform = self.state['val_transform']
         
-        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=self.state['batch_size'], shuffle=True, num_workers=self.state['workers'])
-        val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=self.state['batch_size'], shuffle=False, num_workers=self.state['workers'])
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=self.state['batch_size'],
+            shuffle=True,
+            num_workers=self.state['workers'],
+            pin_memory=True,
+            persistent_workers=True if self.state['workers'] > 0 else False,
+            collate_fn=os_node_collate_fn,
+        )
+        val_loader = torch.utils.data.DataLoader(
+            val_dataset,
+            batch_size=self.state['batch_size'],
+            shuffle=False,
+            num_workers=self.state['workers'],
+            pin_memory=True,
+            persistent_workers=True if self.state['workers'] > 0 else False,
+            collate_fn=os_node_collate_fn,
+        )
 
         if self.state['use_gpu']:
             model = nn.DataParallel(model, device_ids=self.state['device_ids']).cuda()
             criterion = criterion.cuda()
 
-        # ==========================================
-        # 新增 Resume 断点续训逻辑
+        # Resume 断点续训逻辑
         # ==========================================
         if self.state.get('resume'):
             if os.path.isfile(self.state['resume']):
@@ -227,6 +289,9 @@ class Engine(object):
         if self.state['evaluate']:
             return self.validate(val_loader, model, criterion)
 
+        patience = self.state.get('patience', 15)
+        epochs_no_improve = 0
+
         for epoch in range(self.state['start_epoch'], self.state['max_epochs']):
             self.state['epoch'] = epoch
             lr = self.adjust_learning_rate(optimizer)
@@ -237,17 +302,30 @@ class Engine(object):
             score = self.validate(val_loader, model, criterion)
 
             is_best = (score is not None) and (score > self.state['best_score'])
+
             if is_best:
                 self.state['best_score'] = score
-                self.best_metrics = self.state['meter_ap'].compute_paper_metrics() # 保存最佳指标
+                self.state['best_epoch'] = epoch + 1
+                self.best_metrics = self.state['meter_ap'].compute_paper_metrics()
+                epochs_no_improve = 0
+                print(f"=> New best Micro-F1: {score:.4f} at epoch {epoch + 1}")
+            else:
+                epochs_no_improve += 1
+                print(f"=> No improvement for {epochs_no_improve} epoch(s). "
+                    f"Best Micro-F1: {self.state['best_score']:.4f} at epoch {self.state.get('best_epoch', -1)}")
 
             self.save_checkpoint({
                 'epoch': epoch + 1,
                 'state_dict': model.module.state_dict() if self.state['use_gpu'] else model.state_dict(),
                 'best_score': self.state['best_score'],
+                'best_epoch': self.state.get('best_epoch', -1),
                 'optimizer': optimizer.state_dict()
             }, is_best)
 
+            if self.state.get('early_stop', False) and epochs_no_improve >= patience:
+                print(f"=> Early stopping triggered at epoch {epoch + 1}. "
+                    f"Best Micro-F1: {self.state['best_score']:.4f} at epoch {self.state.get('best_epoch', -1)}")
+                break
         return self.state['best_score']
     
     def train(self, data_loader, model, criterion, optimizer):
@@ -302,30 +380,30 @@ class DSDLMultiLabelMAPEngine(Engine):
             inp = inp[0]
         self.state['input'] = inp # semantic vectors
 
+        self.state['sar_nodes'] = input[3]   # [B, N, F]
+        self.state['node_mask'] = input[4]   # [B, N]
+
     def on_forward(self, training, model, criterion, data_loader, optimizer=None):
         opt_var = self.state['opt'].float()
         sar_var = self.state['sar'].float()
         target_var = self.state['target'].float()
         inp_var = self.state['input'].float()
 
-        if inp_var.dim() == 2:
-            inp_var = inp_var.unsqueeze(0).expand(opt_var.size(0), -1, -1)
+        sar_nodes = self.state['sar_nodes'].float()
+        node_mask = self.state['node_mask']
 
-        # ===== 模型调用新增 target_var 和接收 scene_prob =====
-        if training:
-            # 训练时传入 target_var，让模型在内部更新共现矩阵
-            self.state['output'], semantic, res_semantic, feature, deep_semantic, scene_prob = model(
-                opt_var, sar_var, inp_var, target_var
-            )
-        else:
-            # 验证/测试时不传 target，不更新共现矩阵
-            self.state['output'], semantic, res_semantic, feature, deep_semantic, scene_prob = model(
-                opt_var, sar_var, inp_var
-            )
+        if self.state['use_gpu']:
+            sar_nodes = sar_nodes.cuda(non_blocking=True)
+            node_mask = node_mask.cuda(non_blocking=True)
+            opt_var = opt_var.cuda(non_blocking=True)
+            sar_var = sar_var.cuda(non_blocking=True)
+            inp_var = inp_var.cuda(non_blocking=True)
 
-        # ===== 损失函数调用传入 scene_prob =====
+        # [修改] 传给模型
+        self.state['output'], semantic, res_semantic, feature, deep_semantic = model(opt_var, sar_var, inp_var, sar_nodes, node_mask)
+        
         self.state['loss'] = criterion(
-            self.state['output'], target_var, semantic, res_semantic, feature, deep_semantic, scene_prob
+            self.state['output'], target_var, semantic, res_semantic, feature, deep_semantic
         )
 
         if training:

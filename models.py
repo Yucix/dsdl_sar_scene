@@ -2,9 +2,8 @@ import math
 import torch
 import torch.nn as nn
 import torchvision.models as models
-import torch.nn.functional as F
 from vig import ViGBlock
-from sg import SimplePatchifier, BN_Layer
+
 
 def modify_resnet_conv1(model: nn.Module, in_channels: int) -> nn.Module:
     """Modify ResNet conv1 to accept arbitrary input channels (here: 4 for optical, 1 for SAR).
@@ -36,66 +35,61 @@ def modify_resnet_conv1(model: nn.Module, in_channels: int) -> nn.Module:
     model.conv1 = new_conv
     return model
 
-    
-class SARViGBackbone(nn.Module):
-    def __init__(self, in_channels=1, patch_size=16, embed_dim=320, num_blocks=8, num_patches=256, out_dim=2048,drop_path=0.1):
+class SARViGBranch(nn.Module):
+    """
+    SAR 分支：SLICO 动态超像素提取 + 节点特征编码 + ViG 图神经网络
+    输入: SAR 预计算好的节点
+    输出: 图级特征表示 [B, 2048] (与 Optical 分支对齐)
+    """
+    def __init__(self, patch_size=8, embed_dim=128, num_vig_blocks=2, num_segments=64, num_edges=9, head_num=1, drop_path=0.05):
         super().__init__()
-        
-        # 1. 选点与切片 (Patchifier)
-        # 将 256x256 的图切成 256 个 patch 
-        self.patchifier = SimplePatchifier(patch_size=patch_size, num_patches=num_patches)
-        
-        # 2. Patch Embedding
-        # 将每个 patch 映射为 embed_dim 
-        self.patch_embedding = nn.Linear(patch_size * patch_size * in_channels, embed_dim)
-        self.pose_embedding = nn.Parameter(torch.Tensor(1, num_patches, embed_dim))
-        
-        # 3. ViG Backbone (深层图网络)
-        # 堆叠多个 ViG Block 来替代 ResNet 的层
-        # num_blocks 可以设为 6, 8, 12 等，层数越深特征越强
-        self.blocks = nn.Sequential(*[
-            ViGBlock(in_features=embed_dim, num_edges=9, head_num=4, drop_path=drop_path) 
-            for _ in range(num_blocks)
+        self.patch_size = patch_size
+        self.embed_dim = embed_dim
+        self.num_segments = num_segments
+        self.num_edges = num_edges
+        self.head_num = head_num
+
+        # 节点嵌入: patch_size * patch_size -> embed_dim
+        self.node_embed = nn.Sequential(
+            nn.Linear(patch_size * patch_size, embed_dim * 2),
+            nn.LayerNorm(embed_dim * 2),
+            nn.LeakyReLU(),
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.LayerNorm(embed_dim)
+        )
+
+        # ViG Blocks 图传播
+        self.vig_blocks = nn.ModuleList([
+            ViGBlock(embed_dim, num_edges=num_edges, head_num=head_num, drop_path=drop_path)
+            for _ in range(num_vig_blocks)
         ])
-        
-        # 4. 输出投影层
-        # 将 ViG 的输出维度 (embed_dim) 映射到 DSDL 要求的维度 (2048)
-        self.bn = nn.BatchNorm1d(embed_dim)
-        self.classifier_proj = nn.Linear(embed_dim, out_dim)
 
-        # 初始化位置编码
-        nn.init.normal_(self.pose_embedding, std=0.02)
+        # 读出层 (Readout): 将图特征对齐到 2048 维，以便与 ResNet101 融合
+        self.out_proj = nn.Sequential(
+            nn.Linear(embed_dim, 512),  # 512 是一个经验值，可以调整
+            nn.LeakyReLU(),
+            nn.Linear(512, 2048)
+        )
 
-    def forward(self, x):
-        # x: [B, 1, 256, 256]
-        
-        # 1. Patchify
-        # [B, 256, 16*16]
-        x = self.patchifier(x) 
-        # 将 [B, N, 16, 16] 变为 [B, N, 256]
-        x = x.flatten(2)
-        
-        # 2. Embedding + Positional Encoding
-        # [B, 256, embed_dim]
-        x = self.patch_embedding(x)
-        x = x + self.pose_embedding
-        
-        # 3. ViG Layers (提取拓扑特征)
-        # [B, 256, embed_dim]
-        x = self.blocks(x)
-        
-        # 4. Global Pooling (将 256 个节点聚合成 1 个图特征)
-        # 类似于 ResNet 的 AdaptiveAvgPool
-        # [B, embed_dim]
-        x = F.adaptive_max_pool1d(x.transpose(1, 2), 1).squeeze(-1)
-        # 或者使用平均池化: x = x.mean(dim=1)
-        
-        # 5. Projection to 2048
-        x = self.bn(x)
-        x = self.classifier_proj(x) # [B, 2048]
-        
-        return x
-    
+    def forward(self, nodes_batch, node_mask):
+        # nodes_batch: [B, N, F]
+        # node_mask:   [B, N]
+        B, N, Fdim = nodes_batch.shape
+
+        x = self.node_embed(nodes_batch.reshape(B * N, Fdim)).reshape(B, N, self.embed_dim)
+        x = x * node_mask.unsqueeze(-1).float()
+
+        for blk in self.vig_blocks:
+            x = blk(x, node_mask=node_mask)
+
+        mask_float = node_mask.unsqueeze(-1).float()
+        sum_feat = (x * mask_float).sum(dim=1)
+        num_feat = mask_float.sum(dim=1).clamp_min(1.0)
+        graph_feat = sum_feat / num_feat
+
+        out = self.out_proj(graph_feat)
+        return out
+
 class DSDL(nn.Module):
     """Deep Semantic Dictionary Learning with dual-branch visual encoder.
 
@@ -107,11 +101,23 @@ class DSDL(nn.Module):
     The semantic dictionary part (W1/W2 + closed-form alpha) keeps the same.
     """
 
-    def __init__(self, base_model_opt, num_classes, alpha, in_channel=300, num_scenes=3):
+    def __init__(
+        self,
+        base_model_opt,
+        num_classes,
+        alpha,
+        in_channel=300,
+        sar_patch_size=8,
+        sar_embed_dim=128,
+        sar_num_vig_blocks=2,
+        sar_num_segments=64,
+        sar_num_edges=9,
+        sar_head_num=1,
+        sar_drop_path=0.0,
+    ):
         super().__init__()
         self.alpha = alpha
         self.num_classes = num_classes
-        self.num_scenes = num_scenes # 预设场景数 6分类问题暂设3个场景
 
         # Optical backbone
         self.features_opt = nn.Sequential(
@@ -125,16 +131,16 @@ class DSDL(nn.Module):
             base_model_opt.layer4,
         )
 
-        self.features_sar = SARViGBackbone(
-            in_channels=1, 
-            patch_size=16, 
-            embed_dim=320,  # 内部特征维度，可以调大如 512
-            num_blocks=8,   # 堆叠层数，建议 6-12 层
-            num_patches=256,
-            out_dim=2048,    # 必须是 2048，以便与 ResNet 光学分支对齐
-            drop_path=0.1
+        # SAR backbone
+        self.features_sar = SARViGBranch(
+            patch_size=sar_patch_size,
+            embed_dim=sar_embed_dim,
+            num_vig_blocks=sar_num_vig_blocks,
+            num_segments=sar_num_segments,
+            num_edges=sar_num_edges,
+            head_num=sar_head_num,
+            drop_path=sar_drop_path,
         )
-
         self.pooling = nn.AdaptiveMaxPool2d((1, 1))
 
         # ===== semantic dictionary params (same as before) =====
@@ -152,17 +158,7 @@ class DSDL(nn.Module):
         self.image_normalization_mean = [0.485, 0.456, 0.406]
         self.image_normalization_std = [0.229, 0.224, 0.225]
 
-        # 场景感知模块
-        # 1. 场景分类器
-        self.scene_classifier = nn.Linear(2048, self.num_scenes)
-        
-        # 2. 注册全局场景共现频率矩阵 C_matrices [K, C, C]，不参与梯度更新
-        self.register_buffer('C_matrices', torch.zeros(self.num_scenes, num_classes, num_classes))
-        
-        # 3. 动态字典融合的残差权重 (吸收共现信息的程度)
-        self.beta = 0.1
-
-    def forward(self, optical, sar, semantic_vectors, target=None):
+    def forward(self, optical, sar, semantic_vectors, sar_nodes, node_mask):
         """Forward.
 
         optical: Tensor [B, 4, H, W]
@@ -182,39 +178,15 @@ class DSDL(nn.Module):
         if sar.size(1) != 1:
             raise ValueError(f"SAR 分支期望 1 通道输入，但得到了 {sar.size(1)}")
 
-        # ===== 光学分支 =====
-        f_opt = self.features_opt(optical)  # [B, 2048, H, W]
-        # 使用 GMP 并展平空间维度
-        f_opt = self.pooling(f_opt).squeeze(-1).squeeze(-1) # [B, 2048]
+        # ===== dual visual encoder =====
+        f_opt = self.features_opt(optical)
+        f_opt = self.pooling(f_opt).view(f_opt.size(0), -1)  # [B, 2048]
 
-        # ===== SAR分支 =====
-        # 直接通过 ViG Backbone 得到 2048 维特征
-        f_sar = self.features_sar(sar) # [B, 2048]
+        # SAR 分支
+        f_sar = self.features_sar(sar_nodes, node_mask)  # [B, 2048]
 
-        # 直接加和
+        # 光学 + SAR 融合
         feature = f_opt + f_sar
-
-        # ===场景检测与共现矩阵更新===
-        # 1. 预测场景分布
-        scene_logits = self.scene_classifier(feature) # [B, K]
-        scene_prob = F.softmax(scene_logits, dim=-1)  # [B, K]
-        
-        # 2. 训练期：利用真实的 Target 更新全局共现矩阵
-        if self.training and target is not None:
-            assigned_scenes = torch.argmax(scene_prob, dim=1)
-            for i in range(feature.size(0)):
-                s = assigned_scenes[i]
-                y = target[i].unsqueeze(1)
-                self.C_matrices[s] += torch.matmul(y, y.transpose(0, 1))
-
-        # 3. 计算当前的场景共现概率矩阵 P^k
-        # 取对角线元素 (即每个标签出现的总次数)，加 1e-8 防止除0
-        c_diag = self.C_matrices.diagonal(dim1=1, dim2=2).unsqueeze(2) + 1e-8 # [K, C, 1]
-        P_k = self.C_matrices / c_diag # [K, C, C] 条件概率
-        
-        # 4. 根据当前图片的场景分布，动态融合生成专属的 P^I
-        # scene_prob: [B, K], P_k: [K, C, C] -> P_I: [B, C, C]
-        P_I = torch.einsum('bk,kij->bij', scene_prob, P_k)
 
         # ===== semantic dictionary (same) =====
         semantic = torch.matmul(semantic_vectors, self.W1)  # [C,1024]
@@ -225,39 +197,42 @@ class DSDL(nn.Module):
         res_semantic = self.relu(res_semantic)
         res_semantic = torch.matmul(res_semantic, self.W1.transpose(0, 1))
 
-        # ===字典更新===
-        B = feature.size(0)
-        # 将基础字典扩展到 Batch 维度
-        semantic_b = semantic.unsqueeze(0).expand(B, -1, -1) # [B, C, 2048]
-        # 消息传递：P_I @ D
-        message = torch.bmm(P_I, semantic_b) # [B, C, 2048]
-        # 残差融合生成动态字典
-        interacted_semantic = semantic_b + self.beta * message # [B, C, 2048]
-
-        # ===动态闭式解计算===
         device = semantic.device
-        # 计算 (D * D^T + alpha * I) 的批量求逆
-        S_S_T = torch.bmm(interacted_semantic, interacted_semantic.transpose(1, 2)) # [B, C, C]
-        eye_matrix = self.alpha * torch.eye(self.num_classes, device=device).unsqueeze(0).expand(B, -1, -1)
-        inv_term = torch.linalg.inv(S_S_T + eye_matrix) # [B, C, C]
-        # 计算 D * f
-        S_f = torch.bmm(interacted_semantic, feature.unsqueeze(2)) # [B, C, 1]
-        # 最终打分计算
-        score = torch.bmm(inv_term, S_f).squeeze(2) # [B, C]
+        eye_matrix = self.alpha * torch.eye(self.num_classes, device=device)
 
-        return score, semantic_vectors, res_semantic, feature, semantic, scene_prob
+        score = torch.matmul(
+            torch.inverse(torch.matmul(semantic, semantic.transpose(0, 1)) + eye_matrix),
+            torch.matmul(semantic, feature.transpose(0, 1))
+        ).transpose(0, 1)
+
+        return score, semantic_vectors, res_semantic, feature, semantic
 
     def get_config_optim(self, lr, lrp):
+        # Important: optimize both backbones
         return [
+            # 光学分支
             {'params': self.features_opt.parameters(), 'lr': lr * lrp},
+            # SAR分支
             {'params': self.features_sar.parameters(), 'lr': lr},
-            {'params': self.scene_classifier.parameters(), 'lr': lr},  # 场景分类器
-            {'params': self.W1, 'lr': lr},                        
-            {'params': self.W2, 'lr': lr},                        
+            # semantic dictionary
+            {'params': self.W1, 'lr': lr},
+            {'params': self.W2, 'lr': lr},
         ]
 
 
-def load_model(num_classes, alpha, pretrained=True, in_channel=300):
+def load_model(
+    num_classes,
+    alpha,
+    pretrained=True,
+    in_channel=300,
+    sar_patch_size=8,
+    sar_embed_dim=128,
+    sar_num_vig_blocks=2,
+    sar_num_segments=64,
+    sar_num_edges=5,
+    sar_head_num=1,
+    sar_drop_path=0.0
+):
     """Build dual-branch model.
 
     - Optical branch: ResNet101 with conv1=4ch
@@ -276,7 +251,14 @@ def load_model(num_classes, alpha, pretrained=True, in_channel=300):
         num_classes=num_classes,
         alpha=alpha,
         in_channel=in_channel,
+        sar_patch_size=sar_patch_size,
+        sar_embed_dim=sar_embed_dim,
+        sar_num_vig_blocks=sar_num_vig_blocks,
+        sar_num_segments=sar_num_segments,
+        sar_num_edges=sar_num_edges,
+        sar_head_num=sar_head_num,
+        sar_drop_path=sar_drop_path,
     )
 
 
-__all__ = ['DSDL', 'load_model', 'SARViGBackbone']
+__all__ = ['DSDL', 'load_model']
