@@ -23,8 +23,8 @@ from models import load_model
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DEFAULT_DATA_PATH = "/media/sata/xyx/dsdl/dataset"
 DEFAULT_EMBEDDING_PATH = os.path.join(DEFAULT_DATA_PATH, "embeddings/s2_glove_word2vec.pkl")
-DEFAULT_CHECKPOINT_PATH = "/media/sata/xyx/dsdl/checkpoints/dsdl_sar/"
-DEFAULT_LOG_PATH = os.path.join(project_root, "/media/sata/xyx/dsdl/logs/dsdl_sar/")
+DEFAULT_CHECKPOINT_PATH = "/media/sata/xyx/dsdl/checkpoints/dsdl_sar_scene/"
+DEFAULT_LOG_PATH = os.path.join(project_root, "/media/sata/xyx/dsdl/logs/dsdl_sar_scene/")
 
 # 保证实验可复现的随机种子
 def seed_everything(seed=42):
