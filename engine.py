@@ -399,11 +399,27 @@ class DSDLMultiLabelMAPEngine(Engine):
             sar_var = sar_var.cuda(non_blocking=True)
             inp_var = inp_var.cuda(non_blocking=True)
 
-        # [修改] 传给模型
-        self.state['output'], semantic, res_semantic, feature, deep_semantic = model(opt_var, sar_var, inp_var, sar_nodes, node_mask)
-        
+        scene_warmup = self.state.get('scene_warmup', 5)
+        update_scene_counts = training and (self.state['epoch'] >= scene_warmup)
+
+        self.state['output'], semantic, res_semantic, feature, deep_semantic, scene_probs = model(
+            opt_var,
+            sar_var,
+            inp_var,
+            sar_nodes,
+            node_mask,
+            target=target_var,
+            update_scene_counts=update_scene_counts
+        )
+
         self.state['loss'] = criterion(
-            self.state['output'], target_var, semantic, res_semantic, feature, deep_semantic
+            self.state['output'],
+            target_var,
+            semantic,
+            res_semantic,
+            feature,
+            deep_semantic,
+            scene_probs
         )
 
         if training:

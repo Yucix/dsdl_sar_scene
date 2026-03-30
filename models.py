@@ -114,10 +114,21 @@ class DSDL(nn.Module):
         sar_num_edges=9,
         sar_head_num=1,
         sar_drop_path=0.0,
+        num_scenes=3,
+        scene_gamma=0.05,
     ):
         super().__init__()
         self.alpha = alpha
         self.num_classes = num_classes
+        self.num_scenes = num_scenes
+        self.scene_gamma = scene_gamma
+
+        # scene detector
+        self.scene_head = nn.Linear(2048, self.num_scenes)
+
+        # 用单位阵初始化，保证初始阶段退化为原始DSDL
+        init_counts = torch.eye(num_classes, dtype=torch.float32).unsqueeze(0).repeat(self.num_scenes, 1, 1)
+        self.register_buffer("scene_cooccur_counts", init_counts.clone())        
 
         # Optical backbone
         self.features_opt = nn.Sequential(
@@ -158,7 +169,7 @@ class DSDL(nn.Module):
         self.image_normalization_mean = [0.485, 0.456, 0.406]
         self.image_normalization_std = [0.229, 0.224, 0.225]
 
-    def forward(self, optical, sar, semantic_vectors, sar_nodes, node_mask):
+    def forward(self, optical, sar, semantic_vectors, sar_nodes, node_mask, target=None, update_scene_counts=False):
         """Forward.
 
         optical: Tensor [B, 4, H, W]
@@ -187,36 +198,77 @@ class DSDL(nn.Module):
 
         # 光学 + SAR 融合
         feature = f_opt + f_sar
+        # ===== scene prediction =====
+        scene_logits = self.scene_head(feature)              # [B, K]
+        scene_probs = torch.softmax(scene_logits, dim=1)    # [B, K]
 
-        # ===== semantic dictionary (same) =====
-        semantic = torch.matmul(semantic_vectors, self.W1)  # [C,1024]
+                # ===== semantic dictionary =====
+        semantic = torch.matmul(semantic_vectors, self.W1)  # [C, 1024]
         semantic = self.relu(semantic)
-        semantic = torch.matmul(semantic, self.W2)          # [C,2048]
+        base_semantic = torch.matmul(semantic, self.W2)     # [C, 2048]
 
-        res_semantic = torch.matmul(semantic, self.W2.transpose(0, 1))
+        Bsz = feature.size(0)
+        C = self.num_classes
+        device = feature.device
+
+        # ===== update scene co-occurrence counts =====
+        if self.training and update_scene_counts and target is not None:
+            pred_scenes = torch.argmax(scene_probs.detach(), dim=1)  # [B]
+            with torch.no_grad():
+                for b in range(Bsz):
+                    s = pred_scenes[b].item()
+                    y = target[b].float().unsqueeze(1)               # [C,1]
+                    self.scene_cooccur_counts[s] += torch.matmul(y, y.t())
+
+        # ===== build P^k =====
+        P_list = []
+        for k in range(self.num_scenes):
+            Ck = self.scene_cooccur_counts[k]                        # [C,C]
+            diag = torch.diag(Ck).clamp(min=1.0)
+            Pk = Ck / diag.unsqueeze(1)                              # 条件概率
+
+            # 去掉自环，只保留他类传播
+            Pk = Pk.clone()
+            idx = torch.arange(C, device=Pk.device)
+            Pk[idx, idx] = 0.0
+
+            # 行归一化，避免数值过大
+            row_sum = Pk.sum(dim=1, keepdim=True).clamp_min(1e-6)
+            Pk = Pk / row_sum
+
+            P_list.append(Pk)
+
+        P_all = torch.stack(P_list, dim=0)                           # [K,C,C]
+
+        # ===== build P^I = sum_k pi_k P^k =====
+        P_I = torch.einsum('bk,kij->bij', scene_probs, P_all)        # [B,C,C]
+
+        # ===== dynamic dictionary =====
+        base_semantic_batched = base_semantic.unsqueeze(0).expand(Bsz, -1, -1)   # [B,C,2048]
+        propagated_semantic = torch.bmm(P_I, base_semantic_batched)               # [B,C,2048]
+        dynamic_semantic = (1.0 - self.scene_gamma) * base_semantic_batched + self.scene_gamma * propagated_semantic
+
+        # ===== semantic reconstruction =====
+        # 用 base_semantic 做重建更稳，不把scene扰动强行压到语义对齐项
+        res_semantic = torch.matmul(base_semantic, self.W2.transpose(0, 1))
         res_semantic = self.relu(res_semantic)
         res_semantic = torch.matmul(res_semantic, self.W1.transpose(0, 1))
 
-        device = semantic.device
-        eye_matrix = self.alpha * torch.eye(self.num_classes, device=device)
+        # ===== batched DSDL solve =====
+        eye_matrix = self.alpha * torch.eye(C, device=device).unsqueeze(0).expand(Bsz, -1, -1)
+        A = torch.bmm(dynamic_semantic, dynamic_semantic.transpose(1, 2)) + eye_matrix  # [B,C,C]
+        B_rhs = torch.bmm(dynamic_semantic, feature.unsqueeze(2))                         # [B,C,1]
+        score = torch.linalg.solve(A, B_rhs).squeeze(2)                                   # [B,C]
 
-        score = torch.matmul(
-            torch.inverse(torch.matmul(semantic, semantic.transpose(0, 1)) + eye_matrix),
-            torch.matmul(semantic, feature.transpose(0, 1))
-        ).transpose(0, 1)
-
-        return score, semantic_vectors, res_semantic, feature, semantic
+        return score, semantic_vectors, res_semantic, feature, base_semantic, scene_probs
 
     def get_config_optim(self, lr, lrp):
-        # Important: optimize both backbones
         return [
-            # 光学分支
             {'params': self.features_opt.parameters(), 'lr': lr * lrp},
-            # SAR分支
             {'params': self.features_sar.parameters(), 'lr': lr},
-            # semantic dictionary
             {'params': self.W1, 'lr': lr},
             {'params': self.W2, 'lr': lr},
+            {'params': self.scene_head.parameters(), 'lr': lr},
         ]
 
 
@@ -231,7 +283,9 @@ def load_model(
     sar_num_segments=64,
     sar_num_edges=5,
     sar_head_num=1,
-    sar_drop_path=0.0
+    sar_drop_path=0.0,
+    num_scenes=3,
+    scene_gamma=0.05,
 ):
     """Build dual-branch model.
 
@@ -258,6 +312,8 @@ def load_model(
         sar_num_edges=sar_num_edges,
         sar_head_num=sar_head_num,
         sar_drop_path=sar_drop_path,
+        num_scenes=num_scenes,
+        scene_gamma=scene_gamma,
     )
 
 

@@ -144,6 +144,15 @@ parser.add_argument('--sar-num-edges', default=9, type=int)
 parser.add_argument('--sar-head-num', default=1, type=int)
 parser.add_argument('--sar-drop-path', default=0.05, type=float)
 
+parser.add_argument('--num-scenes', default=3, type=int,
+                    help='number of latent scenes')
+parser.add_argument('--scene-warmup', default=5, type=int,
+                    help='epochs before updating scene co-occurrence matrices')
+parser.add_argument('--lambda-en', default=0.1, type=float,
+                    help='weight of entropy auxiliary loss')
+parser.add_argument('--scene-gamma', default=0.05, type=float,
+                    help='dictionary refinement weight')
+
 # ===============================
 # main function
 # ===============================
@@ -183,19 +192,21 @@ def main_os():
     num_classes = 6
 
     model = load_model(
-    num_classes=num_classes,
-    alpha=args.lambd,
-    sar_patch_size=args.sar_patch_size,
-    sar_embed_dim=args.sar_embed_dim,
-    sar_num_vig_blocks=args.sar_num_vig_blocks,
-    sar_num_segments=args.sar_num_segments,
-    sar_num_edges=args.sar_num_edges,
-    sar_head_num=args.sar_head_num,
-    sar_drop_path=args.sar_drop_path,
-)
+        num_classes=num_classes,
+        alpha=args.lambd,
+        sar_patch_size=args.sar_patch_size,
+        sar_embed_dim=args.sar_embed_dim,
+        sar_num_vig_blocks=args.sar_num_vig_blocks,
+        sar_num_segments=args.sar_num_segments,
+        sar_num_edges=args.sar_num_edges,
+        sar_head_num=args.sar_head_num,
+        sar_drop_path=args.sar_drop_path,
+        num_scenes=args.num_scenes,
+        scene_gamma=args.scene_gamma,
+    )
 
     # ============ Loss & Optimizer ============
-    criterion = MyLoss(args.lambd, args.beta)
+    criterion = MyLoss(args.lambd, args.beta, lambda_en=args.lambda_en)
     #  AdamW 优化器
     optimizer = torch.optim.AdamW(
         model.get_config_optim(args.lr, args.lrp),
@@ -220,6 +231,7 @@ def main_os():
         'save_model_path': DEFAULT_CHECKPOINT_PATH,
         'early_stop': args.early_stop,
         'patience': args.patience,
+        'scene_warmup': args.scene_warmup,
     }
 
     engine = DSDLMultiLabelMAPEngine(state)
