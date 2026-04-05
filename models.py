@@ -244,9 +244,20 @@ class DSDL(nn.Module):
         P_I = torch.einsum('bk,kij->bij', scene_probs, P_all)        # [B,C,C]
 
         # ===== dynamic dictionary =====
-        base_semantic_batched = base_semantic.unsqueeze(0).expand(Bsz, -1, -1)   # [B,C,2048]
-        propagated_semantic = torch.bmm(P_I, base_semantic_batched)               # [B,C,2048]
-        dynamic_semantic = (1.0 - self.scene_gamma) * base_semantic_batched + self.scene_gamma * propagated_semantic
+        base_semantic_batched = base_semantic.unsqueeze(0).expand(Bsz, -1, -1)   # [B, C, 2048]
+
+        H0 = base_semantic_batched
+        H1 = torch.bmm(P_I, H0)
+        H2 = torch.bmm(P_I, H1)
+
+        gamma1 = self.scene_gamma
+        gamma2 = self.scene_gamma * 0.5   # 先固定成一阶的一半
+
+        base_weight = 1.0 - gamma1 - gamma2
+        if base_weight < 0:
+            base_weight = 0.0
+
+        dynamic_semantic = base_weight * H0 + gamma1 * H1 + gamma2 * H2
 
         # ===== semantic reconstruction =====
         # 用 base_semantic 做重建更稳，不把scene扰动强行压到语义对齐项
