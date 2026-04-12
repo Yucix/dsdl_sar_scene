@@ -126,6 +126,12 @@ class DSDL(nn.Module):
         # scene detector
         self.scene_head = nn.Linear(2048, self.num_scenes)
 
+        # learnable weighted fusion for optical/SAR branches
+        # softmax([0,0]) => [0.5, 0.5] at initialization
+        self.fusion_logits = nn.Parameter(torch.zeros(2))
+        self.opt_feat_norm = nn.LayerNorm(2048)
+        self.sar_feat_norm = nn.LayerNorm(2048)
+
         # 用单位阵初始化，保证初始阶段退化为原始DSDL
         init_counts = torch.eye(num_classes, dtype=torch.float32).unsqueeze(0).repeat(self.num_scenes, 1, 1)
         self.register_buffer("scene_cooccur_counts", init_counts.clone())        
@@ -196,8 +202,11 @@ class DSDL(nn.Module):
         # SAR 分支
         f_sar = self.features_sar(sar_nodes, node_mask)  # [B, 2048]
 
-        # 光学 + SAR 融合
-        feature = f_opt + f_sar
+        # 光学 + SAR 可学习加权融合
+        f_opt = self.opt_feat_norm(f_opt)
+        f_sar = self.sar_feat_norm(f_sar)
+        fusion_weights = torch.softmax(self.fusion_logits, dim=0)
+        feature = fusion_weights[0] * f_opt + fusion_weights[1] * f_sar
         # ===== scene prediction =====
         scene_logits = self.scene_head(feature)              # [B, K]
         scene_probs = torch.softmax(scene_logits, dim=1)    # [B, K]
@@ -227,10 +236,7 @@ class DSDL(nn.Module):
             diag = torch.diag(Ck).clamp(min=1.0)
             Pk = Ck / diag.unsqueeze(1)                              # 条件概率
 
-            # 去掉自环，只保留他类传播
-            Pk = Pk.clone()
-            idx = torch.arange(C, device=Pk.device)
-            Pk[idx, idx] = 0.0
+            # 保留 self-loop，避免 P@D 直接更新在前期导致字典退化
 
             # 行归一化，避免数值过大
             row_sum = Pk.sum(dim=1, keepdim=True).clamp_min(1e-6)
@@ -246,7 +252,8 @@ class DSDL(nn.Module):
         # ===== dynamic dictionary =====
         base_semantic_batched = base_semantic.unsqueeze(0).expand(Bsz, -1, -1)   # [B,C,2048]
         propagated_semantic = torch.bmm(P_I, base_semantic_batched)               # [B,C,2048]
-        dynamic_semantic = (1.0 - self.scene_gamma) * base_semantic_batched + self.scene_gamma * propagated_semantic
+        # 直接使用 P@D 更新字典
+        dynamic_semantic = propagated_semantic
 
         # ===== semantic reconstruction =====
         # 用 base_semantic 做重建更稳，不把scene扰动强行压到语义对齐项
@@ -266,6 +273,9 @@ class DSDL(nn.Module):
         return [
             {'params': self.features_opt.parameters(), 'lr': lr * lrp},
             {'params': self.features_sar.parameters(), 'lr': lr},
+            {'params': self.opt_feat_norm.parameters(), 'lr': lr},
+            {'params': self.sar_feat_norm.parameters(), 'lr': lr},
+            {'params': [self.fusion_logits], 'lr': lr},
             {'params': self.W1, 'lr': lr},
             {'params': self.W2, 'lr': lr},
             {'params': self.scene_head.parameters(), 'lr': lr},
